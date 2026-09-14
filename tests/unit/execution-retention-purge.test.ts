@@ -65,10 +65,7 @@ const { state, dbStub } = vi.hoisted(() => {
     /** Counts returned to the plan-window dry run's per-page measure. */
     counts: [] as number[],
     countCalls: 0,
-    /** Oldest still-resumable run per drained organization, in call order. */
-    oldest: [] as Array<Date | null>,
-    oldestCalls: 0,
-    /** Instants handed to setPurgeWatermark, in call order. */
+    /** Instants handed to setPurgeWatermarks, in call order. */
     watermarks: [] as unknown[],
     /** Organizations whose subscription changed inside the grace. */
     changed: [] as string[],
@@ -78,9 +75,11 @@ const { state, dbStub } = vi.hoisted(() => {
     transactions: 0,
     /** Reject the write of kind `op` once `after` of them have succeeded. */
     failOn: null as { op: string; after: number } | null,
+    /** Reject every raw statement, such as the floor watermark backfill. */
+    failExecute: false,
   };
 
-  // The aggregate selects -- the dry-run measure and earliestResumableStartedAt --
+  // The aggregate selects -- the dry-run measure and the plan-change lookup --
   // are answered from their own shape rather than from the page queue, so
   // adding one does not shift every page index in every test.
   function makeSelectBuilder(projection?: Record<string, unknown>) {
@@ -91,12 +90,6 @@ const { state, dbStub } = vi.hoisted(() => {
         const n = hoistedState.counts[hoistedState.countCalls] ?? 0;
         hoistedState.countCalls += 1;
         return [{ n }];
-      };
-    } else if (shape.includes("oldest")) {
-      aggregate = () => {
-        const oldest = hoistedState.oldest[hoistedState.oldestCalls] ?? null;
-        hoistedState.oldestCalls += 1;
-        return [{ oldest }];
       };
     } else if (shape.includes("changedOrganizationId")) {
       aggregate = () =>
@@ -140,8 +133,12 @@ const { state, dbStub } = vi.hoisted(() => {
   function makeWriteBuilder(op: string, table: unknown) {
     const builder: Record<string, unknown> = {};
     builder.set = () => builder;
-    builder.values = (row: Record<string, unknown>) => {
-      hoistedState.watermarks.push(row?.executionsPurgedThrough);
+    builder.values = (
+      rows: Record<string, unknown> | Record<string, unknown>[]
+    ) => {
+      for (const row of Array.isArray(rows) ? rows : [rows]) {
+        hoistedState.watermarks.push(row?.executionsPurgedThrough);
+      }
       return builder;
     };
     builder.onConflictDoUpdate = () => {
@@ -173,6 +170,11 @@ const { state, dbStub } = vi.hoisted(() => {
     update: (table: unknown) => makeWriteBuilder("update", table),
     insert: (table: unknown) => makeWriteBuilder("insert", table),
     execute: (statement: unknown) => {
+      if (hoistedState.failExecute) {
+        return Promise.reject(
+          new Error("canceling statement due to statement timeout")
+        );
+      }
       hoistedState.writes.push({ op: "execute", table: statement });
       return Promise.resolve([]);
     },
@@ -207,19 +209,34 @@ function enabledConfig(overrides: Record<string, unknown> = {}) {
   return { ...getRetentionConfig(), enabled: true, ...overrides };
 }
 
+/** A plan-window page row: a run, its organization and its status. */
+function run(
+  id: string,
+  startedAt: string,
+  organizationId: string,
+  status = "success"
+) {
+  return {
+    id,
+    at: startedAt.replace("T", " ").replace("Z", ""),
+    startedAt: new Date(startedAt),
+    organizationId,
+    status,
+  };
+}
+
 beforeEach(() => {
   state.selectPages = [];
   state.selectCalls = 0;
   state.counts = [];
   state.countCalls = 0;
-  state.oldest = [];
-  state.oldestCalls = 0;
   state.watermarks = [];
   state.changed = [];
   state.writes = [];
   state.wheres = [];
   state.transactions = 0;
   state.failOn = null;
+  state.failExecute = false;
 });
 
 /** Depth-first search for an operator marker of `kind` in a predicate tree. */
@@ -306,8 +323,13 @@ describe("runRetentionPurge", () => {
   });
 
   it("reports the organization count and rows for each window", async () => {
-    // orgs, floor pass, watermarks, then the free group's first page.
-    state.selectPages = [ORG_ROWS, [], [], [{ id: "log-1" }]];
+    // orgs, floor pass, watermarks, then the 7-day window's first page.
+    state.selectPages = [
+      ORG_ROWS,
+      [],
+      [],
+      [run("run-1", "2026-08-01T00:00:00.000Z", "org-free")],
+    ];
 
     const result = await runRetentionPurge(enabledConfig(), NOW);
     const planPass = result.passes.find(
@@ -322,7 +344,12 @@ describe("runRetentionPurge", () => {
   });
 
   it("advances the watermark once an organization has drained", async () => {
-    state.selectPages = [ORG_ROWS, [], [], [{ id: "log-1" }]];
+    state.selectPages = [
+      ORG_ROWS,
+      [],
+      [],
+      [run("run-1", "2026-08-01T00:00:00.000Z", "org-free")],
+    ];
 
     await runRetentionPurge(enabledConfig(), NOW);
 
@@ -333,18 +360,90 @@ describe("runRetentionPurge", () => {
   });
 
   it("stops the watermark at the oldest run it had to skip", async () => {
-    // The drain query excludes runs that can still resume, so an empty page
-    // does not mean the range is empty. Advancing to the cutoff would move the
-    // lower bound past those rows and, because the bound is inclusive below,
-    // they would never be selected again -- a run that is phantom today and
-    // succeeds tomorrow would keep its step logs until the floor pass.
-    const skipped = new Date("2026-08-18T12:00:00.000Z");
-    state.selectPages = [ORG_ROWS, [], [], []];
-    state.oldest = [skipped];
+    // The walk passes over a run that can still resume. Advancing to the
+    // cutoff would move the lower bound past it and, because the bound is
+    // inclusive below, it would never be walked again -- a run that is phantom
+    // today and succeeds tomorrow would keep its step logs until the floor pass.
+    const skipped = "2026-08-18T12:00:00.000Z";
+    state.selectPages = [
+      ORG_ROWS,
+      [],
+      [],
+      [
+        run("run-phantom", skipped, "org-free", "phantom"),
+        run("run-later", "2026-08-20T12:00:00.000Z", "org-free"),
+      ],
+    ];
 
     await runRetentionPurge(enabledConfig(), NOW);
 
-    expect(state.watermarks).toEqual([skipped]);
+    expect(state.watermarks).toEqual([new Date(skipped)]);
+    // Only the finished run's logs go; the resumable one is not in the delete.
+    const deletes = state.writes.filter((write) => write.op === "delete");
+    expect(deletes).toHaveLength(1);
+  });
+
+  it("passes over a run whose organization is on another window", async () => {
+    // No organization filter in the query, so the check in code is the only
+    // thing between an enterprise run and the 7-day cutoff.
+    state.selectPages = [
+      ORG_ROWS,
+      [],
+      [],
+      [
+        run("run-ent", "2026-08-01T00:00:00.000Z", "org-ent"),
+        run("run-unknown", "2026-08-02T00:00:00.000Z", "org-gone"),
+      ],
+    ];
+
+    const result = await runRetentionPurge(enabledConfig(), NOW);
+
+    expect(
+      result.passes.find((pass) => pass.pass === "logs_plan_window")?.rows
+    ).toBe(0);
+    expect(state.writes.filter((write) => write.op === "delete")).toEqual([]);
+  });
+
+  it("records how far the walk got when a later page fails", async () => {
+    // The first page's delete commits, the second hits the statement timeout.
+    // The next run must continue after the first page, not start over.
+    state.selectPages = [
+      ORG_ROWS,
+      [],
+      [],
+      [run("run-1", "2026-08-01T00:00:00.000Z", "org-free")],
+      [run("run-2", "2026-08-02T00:00:00.000Z", "org-free")],
+    ];
+    state.failOn = { op: "delete", after: 1 };
+
+    const result = await runRetentionPurge(
+      enabledConfig({ batchSize: 10 }),
+      NOW
+    );
+    const planPass = result.passes.find(
+      (pass) => pass.pass === "logs_plan_window"
+    );
+
+    expect(result.failedPass).toBe("logs_plan_window");
+    expect(planPass).toMatchObject({ rows: 1, budgetExhausted: false });
+    expect(state.watermarks).toEqual([new Date("2026-08-01T00:00:00.000Z")]);
+  });
+
+  it("keeps the rows a pass removed when the watermark backfill fails", async () => {
+    // The floor pass deletes a page, then advancing the watermarks times out.
+    // The rows are gone either way, so the result has to still say so.
+    state.selectPages = [
+      ORG_ROWS,
+      [{ id: "log-1", at: "2025-01-01 00:00:00.000001" }],
+    ];
+    state.failExecute = true;
+
+    const result = await runRetentionPurge(enabledConfig(), NOW);
+
+    expect(result.failedPass).toBe("logs_floor");
+    expect(result.passes).toHaveLength(1);
+    expect(result.passes[0]).toMatchObject({ pass: "logs_floor", rows: 1 });
+    expect(result.passes[0].error).toContain("statement timeout");
   });
 
   it("defers an organization whose plan changed inside the grace", async () => {
@@ -366,7 +465,6 @@ describe("runRetentionPurge", () => {
 
   it("advances to the cutoff when it skipped nothing", async () => {
     state.selectPages = [ORG_ROWS, [], [], []];
-    state.oldest = [null];
 
     await runRetentionPurge(enabledConfig(), NOW);
 
@@ -511,10 +609,11 @@ describe("runRetentionPurge", () => {
     ).toEqual([{ id: "logs.id" }, {}, { id: "executions.id" }]);
   });
 
-  it("skips a run that can still resume in both short-window passes", async () => {
-    // The plan window can be as short as 7 days, and a resumable run's step
-    // logs carry the output_raw the executor reads to pick it back up. The
-    // floor and run-row passes deliberately carry no such guard.
+  it("keeps the resumable guard in the output_raw query", async () => {
+    // A resumable run's step logs carry the output_raw the executor reads to
+    // pick it back up. The plan-window pass makes the same check in code (see
+    // "stops the watermark at the oldest run it had to skip"); the floor and
+    // run-row passes deliberately carry no such guard.
     state.selectPages = [ORG_ROWS];
 
     await runRetentionPurge(enabledConfig(), NOW);
@@ -527,7 +626,7 @@ describe("runRetentionPurge", () => {
           (guard.args[1] as string[]).includes("running")
       );
 
-    expect(statusGuards.length).toBeGreaterThanOrEqual(2);
+    expect(statusGuards.length).toBeGreaterThanOrEqual(1);
     expect(statusGuards[0].args[1]).toEqual([
       "pending",
       "running",
