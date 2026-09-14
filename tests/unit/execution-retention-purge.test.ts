@@ -28,7 +28,11 @@ vi.mock("drizzle-orm", () => {
     notInArray: marker("notInArray"),
     // sql doubles as a namespace: the watermark backfill binds its timestamp
     // through sql.param, because postgres.js has no encoder for a bare Date.
-    sql: Object.assign(marker("sql"), { param: marker("param") }),
+    sql: Object.assign(marker("sql"), {
+      param: marker("param"),
+      join: marker("join"),
+      raw: marker("raw"),
+    }),
   };
 });
 
@@ -77,6 +81,14 @@ const { state, dbStub } = vi.hoisted(() => {
     failOn: null as { op: string; after: number } | null,
     /** Reject every raw statement, such as the floor watermark backfill. */
     failExecute: false,
+    /**
+     * Rows returned by successive raw statements -- the backfill, then probes.
+     * An Error in a slot rejects that statement instead.
+     */
+    executeResults: [] as Array<unknown[] | Error>,
+    executeCalls: 0,
+    /** The id list of every delete, in call order. */
+    deletedIds: [] as unknown[],
   };
 
   // The aggregate selects -- the dry-run measure and the plan-change lookup --
@@ -158,6 +170,9 @@ const { state, dbStub } = vi.hoisted(() => {
       hoistedState.writes.push({ op, table });
       // A write resolves to the rows it touched, as postgres.js reports them.
       const ids = (predicate as { args?: unknown[] } | undefined)?.args?.[1];
+      if (op === "delete") {
+        hoistedState.deletedIds.push(ids);
+      }
       return Promise.resolve({ count: Array.isArray(ids) ? ids.length : 0 });
     };
     return builder;
@@ -170,13 +185,21 @@ const { state, dbStub } = vi.hoisted(() => {
     update: (table: unknown) => makeWriteBuilder("update", table),
     insert: (table: unknown) => makeWriteBuilder("insert", table),
     execute: (statement: unknown) => {
+      // Session settings such as SET LOCAL answer nothing and take no slot.
+      if ((statement as { kind?: string } | undefined)?.kind === "raw") {
+        return Promise.resolve([]);
+      }
       if (hoistedState.failExecute) {
         return Promise.reject(
           new Error("canceling statement due to statement timeout")
         );
       }
       hoistedState.writes.push({ op: "execute", table: statement });
-      return Promise.resolve([]);
+      const rows = hoistedState.executeResults[hoistedState.executeCalls] ?? [];
+      hoistedState.executeCalls += 1;
+      return rows instanceof Error
+        ? Promise.reject(rows)
+        : Promise.resolve(rows);
     },
     transaction: async (callback: (tx: unknown) => Promise<unknown>) => {
       hoistedState.transactions += 1;
@@ -237,6 +260,9 @@ beforeEach(() => {
   state.transactions = 0;
   state.failOn = null;
   state.failExecute = false;
+  state.executeResults = [];
+  state.executeCalls = 0;
+  state.deletedIds = [];
 });
 
 /** Depth-first search for an operator marker of `kind` in a predicate tree. */
@@ -379,8 +405,119 @@ describe("runRetentionPurge", () => {
 
     expect(state.watermarks).toEqual([new Date(skipped)]);
     // Only the finished run's logs go; the resumable one is not in the delete.
-    const deletes = state.writes.filter((write) => write.op === "delete");
-    expect(deletes).toHaveLength(1);
+    expect(state.deletedIds).toEqual([["run-later"]]);
+  });
+
+  describe("an organization behind the window's front", () => {
+    // Two organizations on the 7-day window. org-free has walked up to the
+    // front; org-new has no watermark of its own, so it starts at the floor
+    // cutoff, the way every new organization does.
+    const TWO_FREE_ORGS = [
+      ORG_ROWS[0],
+      {
+        organizationId: "org-new",
+        plan: "free",
+        tier: null,
+        planOverrides: null,
+      },
+      ORG_ROWS[1],
+    ];
+    const FRONT = new Date("2026-08-30T12:00:00.000Z");
+    const FLOOR_CUTOFF = new Date("2025-09-07T12:00:00.000Z");
+    const CUTOFF = new Date("2026-08-31T12:00:00.000Z");
+
+    function walkLowerBounds(): unknown[] {
+      return state.wheres
+        .flatMap((where) => findMarkers(where, "gte"))
+        .map((bound) => bound.args[1]);
+    }
+
+    it("does not send the walk back to the floor when it has nothing there", async () => {
+      state.selectPages = [
+        TWO_FREE_ORGS,
+        [],
+        [{ organizationId: "org-free", executionsPurgedThrough: FRONT }],
+        [],
+      ];
+      // The backfill, then the probe for org-new: no run with logs, no pin.
+      state.executeResults = [[], [{ work: null, pinned: null }]];
+
+      await runRetentionPurge(enabledConfig(), NOW);
+
+      expect(walkLowerBounds()).toContainEqual(FRONT);
+      expect(walkLowerBounds()).not.toContainEqual(FLOOR_CUTOFF);
+      expect(state.watermarks).toEqual([CUTOFF, CUTOFF]);
+    });
+
+    it("starts it at its oldest run with step logs, and pins it at its stuck run", async () => {
+      state.selectPages = [
+        TWO_FREE_ORGS,
+        [],
+        [{ organizationId: "org-free", executionsPurgedThrough: FRONT }],
+        [],
+      ];
+      state.executeResults = [
+        [],
+        [
+          {
+            work: "2026-06-01 00:00:00.5",
+            pinned: "2026-05-01 00:00:00.123456",
+          },
+        ],
+      ];
+
+      await runRetentionPurge(enabledConfig(), NOW);
+
+      expect(walkLowerBounds()).toContainEqual(
+        new Date("2026-06-01T00:00:00.500Z")
+      );
+      // The pin is cut to the millisecond, never rounded up.
+      expect(state.watermarks).toEqual([
+        CUTOFF,
+        new Date("2026-05-01T00:00:00.123Z"),
+      ]);
+    });
+
+    it("walks it from its own watermark when the probe times out", async () => {
+      state.selectPages = [
+        TWO_FREE_ORGS,
+        [],
+        [{ organizationId: "org-free", executionsPurgedThrough: FRONT }],
+        [],
+      ];
+      state.executeResults = [
+        [],
+        Object.assign(new Error("Failed query: SELECT"), {
+          cause: Object.assign(
+            new Error("canceling statement due to statement timeout"),
+            { code: "57014" }
+          ),
+        }),
+      ];
+
+      const result = await runRetentionPurge(enabledConfig(), NOW);
+
+      // Slower, but still correct, and the run carries on.
+      expect(walkLowerBounds()).toContainEqual(FLOOR_CUTOFF);
+      expect(result.failedPass).toBeUndefined();
+      expect(state.watermarks).toEqual([CUTOFF, CUTOFF]);
+    });
+
+    it("fails the pass on a probe error that is not a timeout", async () => {
+      state.selectPages = [
+        TWO_FREE_ORGS,
+        [],
+        [{ organizationId: "org-free", executionsPurgedThrough: FRONT }],
+      ];
+      state.executeResults = [[], new Error("connection terminated")];
+
+      const result = await runRetentionPurge(enabledConfig(), NOW);
+
+      expect(result.failedPass).toBe("logs_plan_window");
+      expect(
+        result.passes.find((pass) => pass.pass === "logs_plan_window")?.error
+      ).toContain("connection terminated");
+    });
   });
 
   it("passes over a run whose organization is on another window", async () => {

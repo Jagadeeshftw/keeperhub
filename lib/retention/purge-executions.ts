@@ -74,6 +74,22 @@ function executionBatchSize(config: RetentionConfig): number {
   return Math.max(1, Math.floor(config.batchSize / 10));
 }
 
+/**
+ * Organizations behind a window's front that are probed one by one before the
+ * walk. Past this many, the walk starts at each organization's watermark.
+ */
+const MAX_LAGGARD_PROBES = 200;
+
+/**
+ * Statement timeout for one laggard probe. A dense organization held down by a
+ * run stuck long ago has many runs to look through; past this the probe gives
+ * up and that organization is walked from its own watermark instead.
+ */
+const PROBE_TIMEOUT_MS = 5000;
+
+/** SQLSTATE query_canceled, what a statement timeout raises. */
+const QUERY_CANCELED = "57014";
+
 export type RetentionPassName =
   | "logs_floor"
   | "logs_plan_window"
@@ -312,9 +328,10 @@ type RunKey = BatchKey & {
  * window is passed over. Rows are matched by their execution's `started_at`,
  * not their own, so a whole run's step logs retire together.
  *
- * The range starts at the lowest watermark among the window's organizations and
- * never below the floor cutoff. Everything older belongs to pass 1, and a dry
- * run, which moves no watermark, would otherwise count those rows twice.
+ * The range starts where the window's organizations still have work (see
+ * resolveWalkFrom) and never below the floor cutoff. Everything older belongs
+ * to pass 1, and a dry run, which moves no watermark, would otherwise count
+ * those rows twice.
  */
 async function purgeLogsPastPlanWindow(
   config: RetentionConfig,
@@ -366,22 +383,25 @@ async function purgeLogsPastPlanWindow(
       if (starts.from.size === 0) {
         continue;
       }
-      const lowest = new Date(
-        Math.min(...[...starts.from.values()].map((start) => start.getTime()))
-      );
 
       // The oldest run per organization the walk had to skip because it can
-      // still resume, read off the pages themselves. The watermark stops
-      // there, so a run that finishes after the walk passed it is picked up by
-      // a later run instead of being left below the watermark for good.
+      // still resume, read off the probes and the pages themselves. The
+      // watermark stops there, so a run that finishes after the walk passed it
+      // is picked up by a later run instead of being left below the watermark
+      // for good.
       const skipped = new Map<string, Date>();
+      const walkFrom = await resolveWalkFrom(starts.from, skipped, budget);
+      if (walkFrom === null) {
+        return result({ budgetExhausted: true });
+      }
+      const lowest = earliest(walkFrom);
       const deletable = (page: RunKey[]): string[] => {
         const ids: string[] = [];
         for (const run of page) {
           const start =
             run.organizationId === null
               ? undefined
-              : starts.from.get(run.organizationId);
+              : walkFrom.get(run.organizationId);
           if (
             run.organizationId === null ||
             start === undefined ||
@@ -391,7 +411,10 @@ async function purgeLogsPastPlanWindow(
           }
           if (!RESUMABLE.has(run.status)) {
             ids.push(run.id);
-          } else if (!skipped.has(run.organizationId)) {
+            continue;
+          }
+          const pin = skipped.get(run.organizationId);
+          if (pin === undefined || run.startedAt < pin) {
             skipped.set(run.organizationId, run.startedAt);
           }
         }
@@ -465,9 +488,17 @@ async function purgeLogsPastPlanWindow(
       const stopped = walk.budgetExhausted || walk.error !== undefined;
       const reached = stopped ? walk.last?.startedAt : cutoff;
       if (reached && !config.dryRun) {
-        await setPurgeWatermarks(
-          watermarksReached(starts.from, skipped, reached)
+        const writeError = await attempt(() =>
+          setPurgeWatermarks(watermarksReached(starts.from, skipped, reached))
         );
+        if (writeError !== undefined) {
+          return result({
+            error:
+              walk.error === undefined
+                ? writeError
+                : `${walk.error}; recording progress also failed: ${writeError}`,
+          });
+        }
       }
 
       if (walk.error !== undefined) {
@@ -512,6 +543,155 @@ async function resolveWalkStarts(
     }
   }
   return { from, deferred: deferredCount };
+}
+
+/**
+ * Where the SQL walk has to start for each organization. The walk is shared by
+ * the whole window, so its lower bound is the lowest of these, and a single
+ * organization far behind the rest would send every run back over the runs of
+ * all the others. That happens for ordinary reasons: a new organization gets
+ * the floor cutoff as its first watermark, a deferred one keeps an old one,
+ * and a run stuck in a resumable status holds one down.
+ *
+ * So each organization behind the window's front is probed on its own,
+ * through its workflows, for the two things that can matter below the front:
+ * the earliest finished run that still has step logs, and the earliest run
+ * that can still resume. The walk starts that organization at the first, or at
+ * the front when there is none, and the second becomes its pin up front. A
+ * probe that times out leaves the organization at its own watermark, which is
+ * slower for the walk but still correct.
+ *
+ * Resolves to null when the budget runs out while probing.
+ */
+async function resolveWalkFrom(
+  from: Map<string, Date>,
+  skipped: Map<string, Date>,
+  budget: RunBudget
+): Promise<Map<string, Date> | null> {
+  const front = latest(from);
+  const laggards = [...from].filter(([, start]) => start < front);
+  if (laggards.length > MAX_LAGGARD_PROBES) {
+    return from;
+  }
+
+  const walkFrom = new Map(from);
+  for (const [organizationId, start] of laggards) {
+    if (budget.exhausted) {
+      return null;
+    }
+    const probe = await probeLaggard(organizationId, start, front);
+    if (probe === null) {
+      continue;
+    }
+    walkFrom.set(organizationId, probe.work ?? front);
+    if (probe.pinned) {
+      skipped.set(organizationId, probe.pinned);
+    }
+  }
+  return walkFrom;
+}
+
+/**
+ * For one organization, within `[from, front)`: the earliest finished run that
+ * still has step logs, and the earliest run that can still resume. A lateral
+ * lookup per workflow, so each is an index seek on (workflow_id, started_at)
+ * rather than a walk of the run table for a match. Null when it timed out.
+ */
+async function probeLaggard(
+  organizationId: string,
+  from: Date,
+  front: Date
+): Promise<{ work: Date | null; pinned: Date | null } | null> {
+  const lower = sql.param(from, workflowExecutions.startedAt);
+  const upper = sql.param(front, workflowExecutions.startedAt);
+  const resumable = sql.join(
+    RESUMABLE_EXECUTION_STATUSES.map((status) => sql`${status}`),
+    sql`, `
+  );
+  const probe = sql`
+    SELECT
+      (SELECT min(r.started_at)
+         FROM workflows w
+         CROSS JOIN LATERAL (
+           SELECT e.started_at
+             FROM workflow_executions e
+            WHERE e.workflow_id = w.id
+              AND e.started_at >= ${lower} AND e.started_at < ${upper}
+              AND e.status NOT IN (${resumable})
+              AND EXISTS (
+                SELECT 1 FROM workflow_execution_logs l WHERE l.execution_id = e.id
+              )
+            ORDER BY e.started_at
+            LIMIT 1
+         ) r
+        WHERE w.organization_id = ${organizationId})::text AS work,
+      (SELECT min(r.started_at)
+         FROM workflows w
+         CROSS JOIN LATERAL (
+           SELECT e.started_at
+             FROM workflow_executions e
+            WHERE e.workflow_id = w.id
+              AND e.started_at >= ${lower} AND e.started_at < ${upper}
+              AND e.status IN (${resumable})
+            ORDER BY e.started_at
+            LIMIT 1
+         ) r
+        WHERE w.organization_id = ${organizationId})::text AS pinned
+  `;
+
+  try {
+    const rows = await db.transaction(async (tx) => {
+      await tx.execute(
+        sql.raw(`SET LOCAL statement_timeout = ${PROBE_TIMEOUT_MS}`)
+      );
+      return await tx.execute<{ work: string | null; pinned: string | null }>(
+        probe
+      );
+    });
+    const row = rows[0];
+    return {
+      work: parseTimestampText(row?.work),
+      pinned: parseTimestampText(row?.pinned),
+    };
+  } catch (error) {
+    if (isStatementTimeout(error)) {
+      return null;
+    }
+    throw error;
+  }
+}
+
+/** True for a statement timeout, whether or not the driver error is wrapped. */
+function isStatementTimeout(error: unknown): boolean {
+  const code = (value: unknown): unknown =>
+    value && typeof value === "object" && "code" in value
+      ? (value as { code: unknown }).code
+      : undefined;
+  return (
+    code(error) === QUERY_CANCELED ||
+    (error instanceof Error && code(error.cause) === QUERY_CANCELED)
+  );
+}
+
+/**
+ * A `timestamp` Postgres printed as text, as a Date. The fraction is cut to
+ * milliseconds, never rounded up, so the instant can only be at or before the
+ * real one -- the safe side for a lower bound and for a watermark.
+ */
+function parseTimestampText(text: string | null | undefined): Date | null {
+  return text ? new Date(`${text.replace(" ", "T")}Z`) : null;
+}
+
+function earliest(instants: Map<string, Date>): Date {
+  return new Date(
+    Math.min(...[...instants.values()].map((instant) => instant.getTime()))
+  );
+}
+
+function latest(instants: Map<string, Date>): Date {
+  return new Date(
+    Math.max(...[...instants.values()].map((instant) => instant.getTime()))
+  );
 }
 
 /**
