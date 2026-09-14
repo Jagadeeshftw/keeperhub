@@ -62,7 +62,7 @@ const { state, dbStub } = vi.hoisted(() => {
     /** Rows returned by successive awaited id selects, in call order. */
     selectPages: [] as unknown[][],
     selectCalls: 0,
-    /** Counts returned to a dry run's countEligible, in call order. */
+    /** Counts returned to the plan-window dry run's per-page measure. */
     counts: [] as number[],
     countCalls: 0,
     /** Oldest still-resumable run per drained organization, in call order. */
@@ -76,9 +76,11 @@ const { state, dbStub } = vi.hoisted(() => {
     /** Predicates handed to every select, in call order. */
     wheres: [] as unknown[],
     transactions: 0,
+    /** Reject the write of kind `op` once `after` of them have succeeded. */
+    failOn: null as { op: string; after: number } | null,
   };
 
-  // The aggregate selects -- countEligible and earliestResumableStartedAt --
+  // The aggregate selects -- the dry-run measure and earliestResumableStartedAt --
   // are answered from their own shape rather than from the page queue, so
   // adding one does not shift every page index in every test.
   function makeSelectBuilder(projection?: Record<string, unknown>) {
@@ -146,9 +148,20 @@ const { state, dbStub } = vi.hoisted(() => {
       hoistedState.writes.push({ op, table });
       return Promise.resolve();
     };
-    builder.where = () => {
+    builder.where = (predicate: unknown) => {
+      const done = hoistedState.writes.filter((write) => write.op === op);
+      const failOn = hoistedState.failOn;
+      if (failOn && failOn.op === op && done.length >= failOn.after) {
+        return Promise.reject(
+          Object.assign(new Error("Failed query: update"), {
+            cause: new Error("canceling statement due to statement timeout"),
+          })
+        );
+      }
       hoistedState.writes.push({ op, table });
-      return Promise.resolve();
+      // A write resolves to the rows it touched, as postgres.js reports them.
+      const ids = (predicate as { args?: unknown[] } | undefined)?.args?.[1];
+      return Promise.resolve({ count: Array.isArray(ids) ? ids.length : 0 });
     };
     return builder;
   }
@@ -206,6 +219,7 @@ beforeEach(() => {
   state.writes = [];
   state.wheres = [];
   state.transactions = 0;
+  state.failOn = null;
 });
 
 /** Depth-first search for an operator marker of `kind` in a predicate tree. */
@@ -361,12 +375,18 @@ describe("runRetentionPurge", () => {
     expect(state.watermarks).toEqual([new Date("2026-08-31T12:00:00.000Z")]);
   });
 
-  it("counts every eligible row and writes nothing in a dry run", async () => {
-    // Deliberately more rows than one batch: the reported figure used to be
-    // the first page, so it was silently capped at batchSize per pass and per
-    // organization. An operator reads this number before turning dry-run off.
-    state.selectPages = [ORG_ROWS];
-    state.counts = [4200];
+  it("walks the same pages in a dry run and writes nothing", async () => {
+    // Pages, not a count: a count over the whole table is a full scan of the
+    // step-log table on prod. The cursor still moves without a write, so the
+    // walk ends, and a batch below the work shows it does not stop at one page.
+    state.selectPages = [
+      ORG_ROWS,
+      [
+        { id: "log-1", at: "2025-01-01 00:00:00.000001" },
+        { id: "log-2", at: "2025-01-02 00:00:00.000002" },
+      ],
+      [{ id: "log-3", at: "2025-01-03 00:00:00.000003" }],
+    ];
 
     const result = await runRetentionPurge(
       enabledConfig({ dryRun: true, batchSize: 2 }),
@@ -376,13 +396,62 @@ describe("runRetentionPurge", () => {
     expect(result.dryRun).toBe(true);
     expect(result.passes[0]).toEqual({
       pass: "logs_floor",
-      rows: 4200,
+      rows: 3,
       budgetExhausted: false,
     });
     // Including the watermark: a dry run deleted nothing, so it must not claim
     // an organization has drained.
     expect(state.writes).toEqual([]);
     expect(state.transactions).toBe(0);
+  });
+
+  it("starts each page after the last row of the page before", async () => {
+    // Without the cursor every page went back over the rows the pages before
+    // it had cleared, and on prod that is a sequential scan per page.
+    const lastOfFirstPage = "2025-01-02 00:00:00.000002";
+    state.selectPages = [
+      ORG_ROWS,
+      [
+        { id: "log-1", at: "2025-01-01 00:00:00.000001" },
+        { id: "log-2", at: lastOfFirstPage },
+      ],
+    ];
+
+    await runRetentionPurge(enabledConfig({ batchSize: 2 }), NOW);
+
+    // The cursor is bound as the text Postgres printed, microseconds and all.
+    const boundValues = state.wheres
+      .flatMap((where) => findMarkers(where, "sql"))
+      .flatMap((fragment) => fragment.args);
+    expect(boundValues).toContain(lastOfFirstPage);
+  });
+
+  it("reports what a pass removed before a page failed, and stops the run", async () => {
+    // orgs, floor, watermarks, free group, then two output_raw pages: the
+    // first update commits, the second hits the statement timeout.
+    state.selectPages = [
+      ORG_ROWS,
+      [],
+      [],
+      [],
+      [{ id: "log-1", at: "2026-08-01 00:00:00.000001" }],
+      [{ id: "log-2", at: "2026-08-02 00:00:00.000002" }],
+    ];
+    state.failOn = { op: "update", after: 1 };
+
+    const result = await runRetentionPurge(enabledConfig(), NOW);
+    const outputRaw = result.passes.find((pass) => pass.pass === "output_raw");
+
+    expect(result.failedPass).toBe("output_raw");
+    expect(outputRaw).toMatchObject({ rows: 1, budgetExhausted: false });
+    expect(outputRaw?.error).toContain(
+      "canceling statement due to statement timeout"
+    );
+    expect(result.passes.map((pass) => pass.pass)).toEqual([
+      "logs_floor",
+      "logs_plan_window",
+      "output_raw",
+    ]);
   });
 
   it("stops on the runtime budget instead of overlapping the next run", async () => {

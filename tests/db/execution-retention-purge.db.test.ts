@@ -408,26 +408,141 @@ describe("execution retention purge (real database)", () => {
     }
   });
 
-  it("counts every eligible row in a dry run and writes nothing", async () => {
-    // batchSize deliberately below the candidate set: the reported figure used
-    // to be one page, so it was capped per pass and per organization.
-    const result = await runRetentionPurge(
+  it("walks every eligible row in a dry run and writes nothing", async () => {
+    // One row per page, so the walk has to follow the cursor across many pages
+    // without a single write moving anything out of its way.
+    const dry = await runRetentionPurge(
       config({ dryRun: true, batchSize: 1 }),
       NOW
     );
-    const planWindow = result.passes.find(
-      (pass) => pass.pass === "logs_plan_window"
-    );
 
-    expect(planWindow?.rows).toBeGreaterThan(1);
     expect(await logExists(logId(ORG_NONE, "old"))).toBe(true);
     expect(await watermarkOf(ORG_NONE)).toBeNull();
+
+    // The same pages, written this time. The floor and plan-window figures
+    // must match; output_raw can only be lower for real, because the passes
+    // before it delete some of the rows the dry run still saw.
+    const real = await runRetentionPurge(config({ batchSize: 1 }), NOW);
+    const rowsOf = (result: typeof real, name: string): number | undefined =>
+      result.passes.find((p) => p.pass === name)?.rows;
+    expect(rowsOf(dry, "logs_floor")).toBe(rowsOf(real, "logs_floor"));
+    expect(rowsOf(dry, "logs_plan_window")).toBe(
+      rowsOf(real, "logs_plan_window")
+    );
+    expect(rowsOf(dry, "output_raw")).toBeGreaterThanOrEqual(
+      rowsOf(real, "output_raw") ?? 0
+    );
+  });
+
+  it("moves past a row whose timestamp carries microseconds", async () => {
+    // Postgres keeps microseconds and a JS Date keeps milliseconds. A cursor
+    // rounded to the millisecond sits before its own row, so with one row per
+    // page the same row comes back forever. The seed writes whole
+    // milliseconds, so give every row a sub-millisecond part the way now() does.
+    const like = `${PREFIX}%`;
+    await queryClient`
+      UPDATE workflow_execution_logs
+      SET started_at = started_at + interval '123456 microseconds',
+          deleted_at = deleted_at + interval '123456 microseconds'
+      WHERE id LIKE ${like}`;
+    await queryClient`
+      UPDATE workflow_executions
+      SET started_at = started_at + interval '123456 microseconds'
+      WHERE id LIKE ${like}`;
+
+    const unfinished = (
+      result: Awaited<ReturnType<typeof runRetentionPurge>>
+    ) =>
+      result.passes.filter((pass) => pass.budgetExhausted).map((p) => p.pass);
+
+    const dry = await runRetentionPurge(
+      config({ dryRun: true, batchSize: 1, maxRuntimeMs: 2000 }),
+      NOW
+    );
+    expect(unfinished(dry)).toEqual([]);
+
+    const real = await runRetentionPurge(
+      config({ batchSize: 1, maxRuntimeMs: 2000 }),
+      NOW
+    );
+    expect(unfinished(real)).toEqual([]);
+    expect(real.passes.find((p) => p.pass === "logs_plan_window")?.rows).toBe(
+      dry.passes.find((p) => p.pass === "logs_plan_window")?.rows
+    );
+    expect(await logExists(logId(ORG_NONE, "old"))).toBe(false);
+  });
+
+  it("flags a dry run the budget stopped as unfinished, and writes nothing", async () => {
+    // What replaced the full-table count: the figure is a lower bound, and the
+    // report says so instead of scanning to make it exact.
+    const result = await runRetentionPurge(
+      config({ dryRun: true, maxRuntimeMs: 0 }),
+      NOW
+    );
+
+    expect(result.passes[0]).toMatchObject({
+      pass: "logs_floor",
+      rows: 0,
+      budgetExhausted: true,
+    });
+    expect(await logExists(logId(ORG_ENT, "past_floor"))).toBe(true);
   });
 
   it("drains across iterations when the batch is smaller than the work", async () => {
+    // batchSize 1 is one step log per page and one run per plan-window page.
     await runRetentionPurge(config({ batchSize: 1 }), NOW);
     expect(await logExists(logId(ORG_NONE, "old"))).toBe(false);
     expect(await logExists(logId(ORG_PRO, "old"))).toBe(false);
+    expect(await logExists(logId(ORG_OVERRIDE, "old"))).toBe(false);
+    // The cursor walks past the run it has to skip, and the watermark still
+    // stops at it.
+    expect(await logExists(logId(ORG_NONE, "phantom"))).toBe(true);
+    expect(await watermarkOf(ORG_NONE)).toEqual(daysAgo(40));
+  });
+
+  it("reports what a pass removed before a page failed, and stops the run", async () => {
+    // A database error partway through a pass, the way the statement timeout
+    // hit staging. The trigger fails the update of one row; with one row per
+    // page, the two pages before it have committed.
+    const target = logId(ORG_PRO, "inside");
+    await queryClient.unsafe(`
+      CREATE OR REPLACE FUNCTION test_retention_fail_update() RETURNS trigger AS $$
+      BEGIN
+        IF NEW.id = '${target}' THEN
+          RAISE EXCEPTION 'simulated statement timeout';
+        END IF;
+        RETURN NEW;
+      END $$ LANGUAGE plpgsql`);
+    await queryClient.unsafe(`
+      CREATE TRIGGER test_retention_fail_update
+      BEFORE UPDATE OF output_raw ON workflow_execution_logs
+      FOR EACH ROW EXECUTE FUNCTION test_retention_fail_update()`);
+
+    try {
+      const result = await runRetentionPurge(config({ batchSize: 1 }), NOW);
+      const outputRaw = result.passes.find(
+        (pass) => pass.pass === "output_raw"
+      );
+
+      expect(result.failedPass).toBe("output_raw");
+      expect(outputRaw?.error).toContain("simulated statement timeout");
+      // Oldest first: the enterprise log (100 days) and the override log (60
+      // days) were nulled before the pro log (20 days) failed.
+      expect(outputRaw?.rows).toBe(2);
+      expect(await outputRawOf(logId(ORG_ENT, "inside"))).toBeNull();
+      expect(await outputRawOf(logId(ORG_OVERRIDE, "inside"))).toBeNull();
+      expect(await outputRawOf(target)).not.toBeNull();
+      // The run stopped at the failed pass.
+      expect(result.passes.at(-1)?.pass).toBe("output_raw");
+      expect(await logExists(`${PREFIX}softdel_past_grace`)).toBe(true);
+    } finally {
+      await queryClient.unsafe(
+        "DROP TRIGGER IF EXISTS test_retention_fail_update ON workflow_execution_logs"
+      );
+      await queryClient.unsafe(
+        "DROP FUNCTION IF EXISTS test_retention_fail_update()"
+      );
+    }
   });
 
   it("writes no watermark when the budget stops the run", async () => {
