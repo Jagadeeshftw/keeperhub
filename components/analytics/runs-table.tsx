@@ -648,7 +648,7 @@ function ExpandableRunRow({
               className="border-t border-dashed border-muted py-2 pl-10 pr-3 text-sm text-muted-foreground"
               colSpan={8}
             >
-              <span className="break-all">{runName}</span>
+              <span className="wrap-anywhere">{runName}</span>
             </td>
           </tr>
           <ExpandedStepRows
