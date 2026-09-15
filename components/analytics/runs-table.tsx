@@ -340,7 +340,7 @@ function StepErrorMessage({ message }: { message: string }): ReactNode {
     <span className="flex min-w-0 shrink items-center gap-1">
       <Tooltip>
         <TooltipTrigger asChild>
-          <span className="min-w-0 max-w-md truncate rounded bg-red-500/10 px-1.5 py-0.5 text-[11px] text-red-700 leading-tight dark:text-red-400">
+          <span className="min-w-0 max-w-md truncate rounded bg-red-500/10 px-1.5 py-0.5 text-[11px] text-red-700 leading-tight dark:text-red-400 max-md:max-w-none max-md:whitespace-normal max-md:wrap-anywhere">
             {message}
           </span>
         </TooltipTrigger>
@@ -374,7 +374,16 @@ function StepLogRow({ step }: StepLogRowProps): ReactNode {
               getStepStatusColor(step.status)
             )}
           />
-          <span className="min-w-0 truncate text-xs text-muted-foreground">
+          {/* `truncate` keeps the label on one line, which on a phone becomes the
+              table's minimum width and pans the row. Below md it wraps instead,
+              and `wrap-anywhere` is the half that matters for a label which is
+              one unbreakable token (a dotted node type): `whitespace-normal`
+              alone only allows breaks at existing soft-wrap opportunities, so
+              such a label still sets the floor. `whitespace-normal` is still
+              needed beside it, because `truncate`'s `nowrap` suppresses wrapping
+              before `overflow-wrap` is consulted. Both return to the single
+              line with an ellipsis at md and up. */}
+          <span className="min-w-0 truncate text-xs text-muted-foreground max-md:whitespace-normal max-md:wrap-anywhere">
             {step.nodeName}
             <span className="ml-1.5 text-muted-foreground/60">
               ({step.nodeType})
