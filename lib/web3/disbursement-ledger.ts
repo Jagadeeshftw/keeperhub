@@ -12,6 +12,7 @@ import {
 import { isErrorStatus } from "@/lib/errors/execution-status";
 import type { BroadcastEvent } from "@/lib/web3/broadcast-hook";
 import { type LegSpec, STALE_CLAIM_MS } from "@/lib/web3/disbursement-plan";
+import { validateChainTxHash } from "@/lib/web3/validate-chain-tx-hash";
 
 /**
  * Database side of web3/disburse. Every state change is one statement, and
@@ -362,6 +363,29 @@ export async function resolveLeg(input: ResolveInput): Promise<ResolveResult> {
       error:
         "Resolving a leg as paid requires the transaction hash that paid it",
     };
+  }
+  if (input.outcome === "paid") {
+    // The chain a hash is checked against is a fact about the leg, frozen at
+    // plan time, not a value the caller supplies - trusting a caller-named
+    // chain here would let a well-formed hash from the wrong chain pass as
+    // evidence for this one. A leg that does not exist reports not_found
+    // here rather than falling through to the update below, which reports
+    // the same thing anyway.
+    const [target] = await db
+      .select({ chainId: disbursementLegs.chainId })
+      .from(disbursementLegs)
+      .where(keyWhere(input))
+      .limit(1);
+    if (!target) {
+      return { ok: false, code: "not_found", error: "No such leg" };
+    }
+    if (!validateChainTxHash(hash, target.chainId)) {
+      return {
+        ok: false,
+        code: "invalid",
+        error: "Transaction hash is not a valid hash for this leg's chain",
+      };
+    }
   }
   const resolvable = or(
     eq(disbursementLegs.status, "unknown"),

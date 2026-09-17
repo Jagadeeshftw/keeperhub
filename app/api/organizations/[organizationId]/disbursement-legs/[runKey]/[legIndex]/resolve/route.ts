@@ -1,13 +1,17 @@
+import { and, eq } from "drizzle-orm";
 import { NextResponse } from "next/server";
 
 const LEG_INDEX_PATTERN = /^\d+$/;
 
+import { db } from "@/lib/db";
+import { member } from "@/lib/db/schema";
 import { ErrorCategory, logSystemError } from "@/lib/logging";
 import { SCOPE_MCP_WRITE } from "@/lib/mcp/oauth-scopes";
 import { getDualAuthContext } from "@/lib/middleware/auth-helpers";
 import { requireScope } from "@/lib/middleware/require-scope";
 import { buildAuditMetadata, recordAuditEvent } from "@/lib/security/audit-log";
 import { resolveLeg } from "@/lib/web3/disbursement-ledger";
+import { validateRunKey } from "@/lib/web3/disbursement-plan";
 
 /**
  * Operator recovery for a disburse leg the platform cannot resolve on its
@@ -17,9 +21,12 @@ import { resolveLeg } from "@/lib/web3/disbursement-ledger";
  * way out of.
  *
  * Same authorization shape as
- * organizations/[organizationId]/execution-digest: dual auth (session or an
- * API-key/OAuth caller hard-scoped to its own org), gated by mcp:write since
- * this moves a leg toward being sent again.
+ * organizations/[organizationId]/execution-digest, matched exactly rather
+ * than approximated: every caller, session or credentialed, must be an
+ * `owner` or `admin` member of the resolved organization, established by the
+ * same `member` query and the same role check execution-digest runs. Gated
+ * by mcp:write on top of that since this moves a leg toward being sent
+ * again.
  */
 
 type Body = {
@@ -60,13 +67,17 @@ export async function POST(
 ): Promise<NextResponse> {
   const {
     organizationId: organizationIdParam,
-    runKey,
+    runKey: runKeyRaw,
     legIndex: legIndexRaw,
   } = await context.params;
   if (!LEG_INDEX_PATTERN.test(legIndexRaw)) {
     return NextResponse.json({ error: "Invalid leg index" }, { status: 400 });
   }
   const legIndex = Number.parseInt(legIndexRaw, 10);
+  const runKey = validateRunKey(runKeyRaw);
+  if (runKey === null) {
+    return NextResponse.json({ error: "Invalid run key" }, { status: 400 });
+  }
 
   const authContext = await getDualAuthContext(request);
   if ("error" in authContext) {
@@ -103,10 +114,30 @@ export async function POST(
     }
     organizationId = callerOrgId;
   } else if (authMethod !== "session" && callerOrgId !== organizationId) {
-    // API-key and OAuth callers are hard-scoped to the org they authenticated
-    // as; a session caller's org membership is not checked here on purpose --
-    // resolving a leg is an operator action on a specific run, not an
-    // org-settings change, so any member (not only an owner/admin) may do it.
+    // An API-key or OAuth caller is hard-scoped to the org it authenticated
+    // as; a mismatch is refused before the membership query below even runs.
+    return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+  }
+
+  // Every caller, session or credentialed, must be an owner or admin of the
+  // resolved organization -- the same query and the same role requirement
+  // execution-digest/route.ts uses. Resolving a leg decides which of two
+  // payment bugs happens next (a false "not_paid" re-sends money that
+  // already went out; a false "paid" suppresses a real payment), so it gets
+  // the same bar as an org-settings change, not a lower one.
+  const [membership] = await db
+    .select({ role: member.role })
+    .from(member)
+    .where(
+      and(eq(member.organizationId, organizationId), eq(member.userId, userId))
+    )
+    .limit(1);
+  if (
+    !(
+      membership &&
+      (membership.role === "owner" || membership.role === "admin")
+    )
+  ) {
     return NextResponse.json({ error: "Forbidden" }, { status: 403 });
   }
 

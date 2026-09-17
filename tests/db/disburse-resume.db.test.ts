@@ -326,7 +326,10 @@ describe("web3/disburse resume (real database)", () => {
       runKey: "payroll-4",
       legIndex: 0,
       outcome: "paid",
-      transactionHash: "0xmaybe",
+      // resolveLeg now validates the hash's format for the leg's chain;
+      // "0xmaybe" (the placeholder used elsewhere in this file for a
+      // pre-broadcast-hook value) is not a well-formed EVM hash.
+      transactionHash: `0x${"beef".repeat(16)}`,
       note: "Transfer found on Basescan in block 1",
       userId: USER,
     });
