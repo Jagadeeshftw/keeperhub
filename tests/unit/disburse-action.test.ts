@@ -33,8 +33,13 @@ vi.mock("@/lib/web3/disbursement-ledger", () => {
 vi.mock("@/lib/execute/value-ledger", () => ({
   withStepValueCap: (_args: unknown, run: () => unknown) => run(),
 }));
+type StablecoinCapDecision =
+  | { kind: "allowed" }
+  | { kind: "denied"; error: string };
 const stablecoinBatchCheck = vi.hoisted(() =>
-  vi.fn(() => Promise.resolve({ kind: "allowed" as const }))
+  vi.fn<() => Promise<StablecoinCapDecision>>(() =>
+    Promise.resolve({ kind: "allowed" })
+  )
 );
 vi.mock("@/lib/execute/stablecoin-cap", () => ({
   checkStablecoinTransferAmountBatch: stablecoinBatchCheck,
@@ -201,7 +206,8 @@ describe("web3/disburse stablecoin aggregate cap", () => {
   it("refuses the whole run when the aggregate exceeds the platform's batch cap", async () => {
     stablecoinBatchCheck.mockResolvedValueOnce({
       kind: "denied",
-      error: "Stablecoin transfer of 10,000.00 USDC across 2 leg(s) exceeds the 2,000.00 USD per-transaction batch limit",
+      error:
+        "Stablecoin transfer of 10,000.00 USDC across 2 leg(s) exceeds the 2,000.00 USD per-transaction batch limit",
     });
 
     expect(
