@@ -6,6 +6,7 @@ import { withStepValueCap } from "@/lib/execute/value-ledger";
 import { ErrorCategory, logSystemError } from "@/lib/logging";
 import { getChainIdFromNetwork } from "@/lib/rpc/network-utils";
 import { isSolanaChain } from "@/lib/rpc/solana-chains";
+import { resolveSignerForNode, SIGNER_MODE } from "@/lib/safe/signer-resolver";
 import { getErrorMessage } from "@/lib/utils";
 import type { BroadcastEvent } from "@/lib/web3/broadcast-hook";
 import {
@@ -226,6 +227,32 @@ async function prepare(
   );
   if (!orgCtx.success) {
     return { ok: false, error: orgCtx.error };
+  }
+
+  // Refused up front, before anything is claimed. The Safe and Role signer
+  // paths broadcast through helpers that never run the pre-broadcast hook,
+  // and a leg sent without it could be reported failed after it went out.
+  if (!isSolana) {
+    let mode: Awaited<ReturnType<typeof resolveSignerForNode>>;
+    try {
+      mode = await resolveSignerForNode({
+        organizationId: orgCtx.organizationId,
+        chainId,
+        web3Connection: undefined,
+      });
+    } catch (error) {
+      return {
+        ok: false,
+        error: `Failed to resolve the signer: ${getErrorMessage(error)}`,
+      };
+    }
+    if (mode.kind !== SIGNER_MODE.EOA) {
+      return {
+        ok: false,
+        error:
+          "Disburse sends from the organization wallet only. This network is set to a Safe or Role signer, which Disburse does not support yet.",
+      };
+    }
   }
 
   return {

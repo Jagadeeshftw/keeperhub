@@ -131,6 +131,7 @@ All error codes are stable kebab-case identifiers. When any error is present, `v
 | `missing-write-action-for-write-workflow` | `workflowType` is `"write"` but no node is a write action (`write-contract` or a protocol-write step) | Add a write-action node, or change `workflowType` to `"read"` |
 | `unknown-chain-id` | A node's `network` field is a chain ID not enabled on the platform | Use a supported chain ID — call `list_action_schemas?includeChains=true` to see the full list |
 | `invalid-token-address` | A `contractAddress` or `tokenConfig.customToken.address` fails the EVM address format check | Use a valid `0x`-prefixed 40-hex-character address |
+| `disburse-signer-unsupported` | A Disburse node sets `web3Connection` to a Safe. Disburse sends from the organization wallet only | Remove `web3Connection` from the node |
 
 ## Warning code reference
 

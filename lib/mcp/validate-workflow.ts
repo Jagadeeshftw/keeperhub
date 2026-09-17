@@ -84,6 +84,8 @@ export function validateWorkflow(
   // allowance-consuming method with no check-allowance node in the workflow.
   runAllowancePreflightCheck(workflow, warnings);
 
+  runDisburseSignerCheck(workflow, errors);
+
   // VALID-05: chain ID existence — only when caller pre-fetched chainIds.
   // Per-node check mitigates Pitfall 12 (multi-chain WETH false positives).
   if (opts.chainIds !== undefined) {
@@ -333,6 +335,47 @@ function runWriteActionCheck(
         'workflowType is "read" but workflow contains a write-action node. Confirm this is intentional.',
       parameterPath: "workflowType",
     });
+  }
+}
+
+const DISBURSE_ACTION_TYPE = "web3/disburse";
+
+/**
+ * web3/disburse sends from the organization wallet only. It records each leg
+ * through the pre-broadcast hook, and the Safe and Role signer paths broadcast
+ * through helpers that never run it, so a leg sent that way could be reported
+ * as not paid after it went out. The node has no Web3 Connection field; this
+ * catches a config that sets one anyway (an import, or an API-built node). An
+ * organization policy that routes the network through a Safe is only known at
+ * run time, where the node refuses before recording anything.
+ */
+function runDisburseSignerCheck(
+  workflow: ValidatorWorkflow,
+  errors: ValidationIssue[]
+): void {
+  if (!Array.isArray(workflow.nodes)) {
+    return;
+  }
+  for (const [index, node] of workflow.nodes.entries()) {
+    if (getWorkflowActionType(node) !== DISBURSE_ACTION_TYPE) {
+      continue;
+    }
+    const config = (node as { data?: { config?: Record<string, unknown> } })
+      .data?.config;
+    const connection = config?.web3Connection;
+    if (
+      typeof connection === "string" &&
+      connection !== "" &&
+      connection !== "default" &&
+      connection !== "eoa"
+    ) {
+      errors.push({
+        code: VALIDATION_ERROR_CODES.DISBURSE_SIGNER_UNSUPPORTED,
+        message:
+          "Disburse sends from the organization wallet only; Safe and Role signers are not supported. Remove web3Connection from this node.",
+        parameterPath: `nodes[${index}].data.config.web3Connection`,
+      });
+    }
   }
 }
 

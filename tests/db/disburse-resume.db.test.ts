@@ -563,6 +563,17 @@ describe("web3/disburse resume (real database)", () => {
     expect(calls(R1)).toBe(1);
     expect(calls(R2)).toBe(1);
   });
+
+  it("refuses a Safe or Role signer before recording anything", async () => {
+    signer.kind = "safe";
+
+    const result = await run("payroll-13", TWO_LEGS);
+
+    expect(result.success).toBe(false);
+    expect(result.success ? "" : result.error).toMatch(/Safe or Role signer/);
+    expect(await legRow("payroll-13", 0)).toBeUndefined();
+    expect(calls(R1)).toBe(0);
+  });
 });
 
 describe("resolveLeg (real database)", () => {
