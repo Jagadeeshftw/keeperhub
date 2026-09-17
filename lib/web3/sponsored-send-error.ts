@@ -22,6 +22,11 @@ export type SponsoredSendDecision =
       // failure would hide that from the operator. The revert case is a
       // clean, terminal outcome and stays eligible for softening.
       errorClass?: ExecutionErrorType;
+      // Turnkey's activity id, whenever Turnkey assigned one. A send that ends
+      // pending before any hash exists carries nothing else: without this id
+      // the transaction may be on its way to the chain and there is no handle
+      // anywhere in our data to look it up by.
+      sendTransactionStatusId?: string;
     }
   | { fallback: true };
 
@@ -64,6 +69,9 @@ export function resolveSponsoredSendError(
       fallback: false,
       error: `Transaction reverted: ${error.message} (tx ${error.txHash})`,
       transactionHash: error.txHash,
+      ...(error.sendTransactionStatusId
+        ? { sendTransactionStatusId: error.sendTransactionStatusId }
+        : {}),
     };
   }
 
@@ -91,6 +99,9 @@ export function resolveSponsoredSendError(
       // not confirm. Without it the transaction exists on-chain and nowhere in
       // our data, which leaves nothing to reconcile against.
       ...(error.txHash ? { transactionHash: error.txHash } : {}),
+      ...(error.sendTransactionStatusId
+        ? { sendTransactionStatusId: error.sendTransactionStatusId }
+        : {}),
       errorClass: ExecutionErrorType.SYSTEM,
     };
   }
