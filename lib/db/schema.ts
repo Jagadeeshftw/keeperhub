@@ -665,6 +665,11 @@ export type TransactionHashEntry = {
   chainId?: number;
   network?: string;
   iterationIndex?: number;
+  // The leg of a multi-transfer step (web3/disburse) this hash paid. A step
+  // that sends several transactions reports each one, so iterationIndex -
+  // which names a For Each iteration, and a disburse node can sit inside one -
+  // cannot also carry the leg.
+  legIndex?: number;
   // KEEP-966: independent on-chain verification result for this hash,
   // populated by logWorkflowCompleteDb/selfHealWorkflowAfterLateStepCommit at
   // finalize time. Named receiptStatus (not `status`) to avoid colliding with
