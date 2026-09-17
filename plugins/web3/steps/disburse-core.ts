@@ -430,7 +430,9 @@ function sendLeg(
         stepFunction: "transferSplTokenStep",
         config: { network: setup.network },
         executionId: context?.executionId,
-        valueCapReserved: context?.valueCapReserved,
+        // Nothing was reserved up front for this step on any path
+        // (lib/execute/reserved-value.ts), so every leg is charged here.
+        valueCapReserved: false,
       },
       () =>
         transferSplTokenCore({
@@ -449,7 +451,9 @@ function sendLeg(
       stepFunction: "transferFundsStep",
       config: { network: setup.network, amount },
       executionId: context?.executionId,
-      valueCapReserved: context?.valueCapReserved,
+      // Nothing was reserved up front for this step on any path
+        // (lib/execute/reserved-value.ts), so every leg is charged here.
+        valueCapReserved: false,
     },
     () =>
       transferFundsCore({

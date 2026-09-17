@@ -32,8 +32,12 @@ vi.mock("@/lib/logging", () => ({
   logSystemWarn: vi.fn(),
 }));
 
+const capCalls = vi.hoisted(() => [] as unknown[]);
 vi.mock("@/lib/execute/value-ledger", () => ({
-  withStepValueCap: (_args: unknown, run: () => unknown) => run(),
+  withStepValueCap: (args: unknown, run: () => unknown) => {
+    capCalls.push(args);
+    return run();
+  },
 }));
 
 const signer = vi.hoisted(() => ({ kind: "eoa" as string }));
@@ -62,11 +66,8 @@ const script = vi.hoisted(() => ({
   calls: new Map<string, number>(),
 }));
 
-vi.mock("@/plugins/web3/steps/transfer-token-core", () => ({
-  transferTokenCore: (input: {
-    recipientAddress: string;
-    _broadcastHook: Hook;
-  }) => {
+const scripted = vi.hoisted(
+  () => (input: { recipientAddress: string; _broadcastHook: Hook }) => {
     const key = input.recipientAddress.toLowerCase();
     script.calls.set(key, (script.calls.get(key) ?? 0) + 1);
     const next = script.queue.get(key)?.shift();
@@ -74,10 +75,13 @@ vi.mock("@/plugins/web3/steps/transfer-token-core", () => ({
       throw new Error(`no scripted send for ${key}`);
     }
     return next(input._broadcastHook);
-  },
+  }
+);
+vi.mock("@/plugins/web3/steps/transfer-token-core", () => ({
+  transferTokenCore: scripted,
 }));
 vi.mock("@/plugins/web3/steps/transfer-funds-core", () => ({
-  transferFundsCore: () => Promise.reject(new Error("not used")),
+  transferFundsCore: scripted,
 }));
 vi.mock("@/plugins/web3/steps/transfer-spl-token-core", () => ({
   transferSplTokenCore: () => Promise.reject(new Error("not used")),
@@ -208,6 +212,7 @@ beforeEach(async () => {
   await seed();
   script.queue.clear();
   script.calls.clear();
+  capCalls.length = 0;
   signer.kind = "eoa";
 });
 
@@ -573,6 +578,70 @@ describe("web3/disburse resume (real database)", () => {
     expect(result.success ? "" : result.error).toMatch(/Safe or Role signer/);
     expect(await legRow("payroll-13", 0)).toBeUndefined();
     expect(calls(R1)).toBe(0);
+  });
+});
+
+describe("web3/disburse spend cap (real database)", () => {
+  // The direct-execution route reserves nothing for disburse and flags the
+  // step as reserved, so a leg that honoured the flag would move native value
+  // uncharged.
+  it("charges every native leg, even when the context says value was reserved", async () => {
+    const { disburseCore } = await import(
+      "../../plugins/web3/steps/disburse-core"
+    );
+    script_(R1, pay("0xn1"));
+    script_(R2, pay("0xn2"));
+
+    const result = await disburseCore({
+      network: "base-sepolia",
+      assetType: "native",
+      runKey: "native-cap",
+      legs: [
+        { recipient: R1, amount: "0.25" },
+        { recipient: R2, amount: "0.5" },
+      ],
+      _context: {
+        executionId: `${PREFIX}exec_direct`,
+        organizationId: ORG,
+        nodeId: "disburse-1",
+        nodeName: "Disburse",
+        nodeType: "action",
+        valueCapReserved: true,
+      },
+    });
+
+    expect(result.success).toBe(true);
+    expect(capCalls).toEqual([
+      expect.objectContaining({
+        stepFunction: "transferFundsStep",
+        config: { network: "base-sepolia", amount: "0.25" },
+        valueCapReserved: false,
+      }),
+      expect.objectContaining({
+        config: { network: "base-sepolia", amount: "0.5" },
+        valueCapReserved: false,
+      }),
+    ]);
+
+    // A re-run skips both legs and reserves nothing for them.
+    capCalls.length = 0;
+    await disburseCore({
+      network: "base-sepolia",
+      assetType: "native",
+      runKey: "native-cap",
+      legs: [
+        { recipient: R1, amount: "0.25" },
+        { recipient: R2, amount: "0.5" },
+      ],
+      _context: {
+        executionId: `${PREFIX}exec_direct_2`,
+        organizationId: ORG,
+        nodeId: "disburse-1",
+        nodeName: "Disburse",
+        nodeType: "action",
+      },
+    });
+    expect(capCalls).toEqual([]);
   });
 });
 
