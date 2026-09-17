@@ -85,6 +85,7 @@ export function validateWorkflow(
   runAllowancePreflightCheck(workflow, warnings);
 
   runDisburseSignerCheck(workflow, errors);
+  runTransferInForEachWarning(workflow, warnings);
 
   // VALID-05: chain ID existence — only when caller pre-fetched chainIds.
   // Per-node check mitigates Pitfall 12 (multi-chain WETH false positives).
@@ -339,6 +340,92 @@ function runWriteActionCheck(
 }
 
 const DISBURSE_ACTION_TYPE = "web3/disburse";
+
+// The two action types the reported issue observed double-paying inside a
+// For Each: each sends one signed transaction with maxRetries=0 and no
+// per-leg record, so a re-run after a partial failure resends every leg,
+// paid or not. Scoped to these two, not every write action, because they are
+// the specific shape the issue and the migration path (web3/disburse) cover.
+const LOOP_RISK_ACTION_TYPES = new Set([
+  "web3/transfer-funds",
+  "web3/transfer-token",
+]);
+
+type LiteNode = { id: string; data?: { config?: Record<string, unknown> } };
+type LiteEdge = {
+  source: string;
+  target: string;
+  sourceHandle?: string | null;
+};
+
+/**
+ * A lightweight, over-inclusive approximation of the executor's loop-body
+ * walk (identifyLoopBody, executor.workflow.ts), kept separate on purpose:
+ * this module must stay free of heavy imports (fast-tier purity gate), and a
+ * warning can afford to be generous where an error cannot. Follows the `loop`
+ * sourceHandle when the graph is handle-aware, otherwise every outgoing edge
+ * (legacy graphs), and does not descend past a nested For Each's own start --
+ * that node is walked separately when the outer loop reaches it in
+ * `runTransferInForEachWarning`'s own iteration over every For Each node.
+ */
+function bodyNodeIds(forEachId: string, edges: LiteEdge[]): Set<string> {
+  const loopTargets = edges
+    .filter((e) => e.source === forEachId && e.sourceHandle === "loop")
+    .map((e) => e.target);
+  const legacyTargets = edges
+    .filter((e) => e.source === forEachId && !e.sourceHandle)
+    .map((e) => e.target);
+  const seeds = loopTargets.length > 0 ? loopTargets : legacyTargets;
+
+  const visited = new Set<string>();
+  const queue = [...seeds];
+  while (queue.length > 0) {
+    const nodeId = queue.shift();
+    if (nodeId === undefined || visited.has(nodeId) || nodeId === forEachId) {
+      continue;
+    }
+    visited.add(nodeId);
+    for (const edge of edges) {
+      if (edge.source === nodeId && !visited.has(edge.target)) {
+        queue.push(edge.target);
+      }
+    }
+  }
+  return visited;
+}
+
+function runTransferInForEachWarning(
+  workflow: ValidatorWorkflow,
+  warnings: ValidationIssue[]
+): void {
+  if (!(Array.isArray(workflow.nodes) && Array.isArray(workflow.edges))) {
+    return;
+  }
+  const nodes = workflow.nodes as LiteNode[];
+  const edges = workflow.edges as LiteEdge[];
+  const forEachIds = nodes
+    .filter((n) => getWorkflowActionType(n) === "For Each")
+    .map((n) => n.id);
+  if (forEachIds.length === 0) {
+    return;
+  }
+  const byId = new Map(nodes.map((n) => [n.id, n]));
+
+  for (const forEachId of forEachIds) {
+    const body = bodyNodeIds(forEachId, edges);
+    for (const nodeId of body) {
+      const node = byId.get(nodeId);
+      const actionType = node ? getWorkflowActionType(node) : undefined;
+      if (actionType && LOOP_RISK_ACTION_TYPES.has(actionType)) {
+        warnings.push({
+          code: VALIDATION_WARNING_CODES.TRANSFER_IN_FOR_EACH_BODY,
+          message: `${actionType} inside a For Each body re-sends every leg, paid or not, if the run is re-run after a partial failure -- there is no per-leg record to skip what already paid. This is not fixed by anything in this workflow; use web3/disburse for a payout that can resume safely.`,
+          parameterPath: `nodes[${nodes.indexOf(node as LiteNode)}]`,
+        });
+      }
+    }
+  }
+}
 
 /**
  * web3/disburse sends from the organization wallet only. It records each leg
