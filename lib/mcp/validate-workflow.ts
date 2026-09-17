@@ -20,6 +20,12 @@ import {
   chainExists,
   tokenAddressFormat,
 } from "@/lib/mcp/validate-workflow-web3";
+import { buildEdgesBySourceHandle } from "@/lib/workflow/editor/edge-handle-utils";
+import { buildEdgesBySource } from "@/lib/workflow/executor/convergence-barrier";
+import {
+  identifyLoopBody,
+  type LoopBodyNode,
+} from "@/lib/workflow/executor/loop-body";
 
 export type ValidationIssue = {
   code: ValidationErrorCode | ValidationWarningCode;
@@ -351,7 +357,10 @@ const LOOP_RISK_ACTION_TYPES = new Set([
   "web3/transfer-token",
 ]);
 
-type LiteNode = { id: string; data?: { config?: Record<string, unknown> } };
+type LiteNode = {
+  id: string;
+  data?: { type?: string; config?: Record<string, unknown> };
+};
 type LiteEdge = {
   source: string;
   target: string;
@@ -359,41 +368,25 @@ type LiteEdge = {
 };
 
 /**
- * A lightweight, over-inclusive approximation of the executor's loop-body
- * walk (identifyLoopBody, executor.workflow.ts), kept separate on purpose:
- * this module must stay free of heavy imports (fast-tier purity gate), and a
- * warning can afford to be generous where an error cannot. Follows the `loop`
- * sourceHandle when the graph is handle-aware, otherwise every outgoing edge
- * (legacy graphs), and does not descend past a nested For Each's own start --
- * that node is walked separately when the outer loop reaches it in
- * `runTransferInForEachWarning`'s own iteration over every For Each node.
+ * This used to be a hand-maintained approximation of the executor's real
+ * loop-body walk, justified as "deliberately over-inclusive" because a
+ * warning can afford to be generous where an error cannot. It was not
+ * uniformly over-inclusive: a For Each whose outgoing edge carried a
+ * non-`loop` sourceHandle made the executor's real walk seed from every
+ * outgoing edge (handle-aware mode requires a `loop` OR `done` handle to
+ * exist, not specifically `loop`), while this approximation's
+ * `legacyTargets` filtered on `!sourceHandle` and excluded it -- producing
+ * no warning for a transfer the executor genuinely runs once per iteration.
+ * It also warned on transfers reachable only through a Collect node, which
+ * the executor never runs as loop body at all.
+ *
+ * Now calls `identifyLoopBody` directly -- the same function
+ * executor.workflow.ts runs at execution time, imported from
+ * lib/workflow/executor/loop-body.ts, which has no imports beyond types and
+ * therefore costs this module nothing against the fast-tier purity gate.
+ * One function decides what a For Each's body is; this warning and the
+ * executor can no longer disagree about it.
  */
-function bodyNodeIds(forEachId: string, edges: LiteEdge[]): Set<string> {
-  const loopTargets = edges
-    .filter((e) => e.source === forEachId && e.sourceHandle === "loop")
-    .map((e) => e.target);
-  const legacyTargets = edges
-    .filter((e) => e.source === forEachId && !e.sourceHandle)
-    .map((e) => e.target);
-  const seeds = loopTargets.length > 0 ? loopTargets : legacyTargets;
-
-  const visited = new Set<string>();
-  const queue = [...seeds];
-  while (queue.length > 0) {
-    const nodeId = queue.shift();
-    if (nodeId === undefined || visited.has(nodeId) || nodeId === forEachId) {
-      continue;
-    }
-    visited.add(nodeId);
-    for (const edge of edges) {
-      if (edge.source === nodeId && !visited.has(edge.target)) {
-        queue.push(edge.target);
-      }
-    }
-  }
-  return visited;
-}
-
 function runTransferInForEachWarning(
   workflow: ValidatorWorkflow,
   warnings: ValidationIssue[]
@@ -410,9 +403,31 @@ function runTransferInForEachWarning(
     return;
   }
   const byId = new Map(nodes.map((n) => [n.id, n]));
+  const nodeMap = new Map<string, LoopBodyNode>(
+    nodes.map((n) => [
+      n.id,
+      { data: { type: n.data?.type ?? "", config: n.data?.config } },
+    ])
+  );
+  const edgesBySource = buildEdgesBySource(edges);
+  const edgesBySourceHandle = buildEdgesBySourceHandle(edges);
 
   for (const forEachId of forEachIds) {
-    const body = bodyNodeIds(forEachId, edges);
+    let body: string[];
+    try {
+      body = identifyLoopBody(
+        forEachId,
+        edgesBySource,
+        nodeMap,
+        edgesBySourceHandle
+      ).bodyNodeIds;
+    } catch {
+      // A topology identifyLoopBody itself refuses (e.g. two For Each loops
+      // sharing one in-body Collect) is a different, structural problem;
+      // this warning is not the check responsible for surfacing it, and the
+      // executor will refuse the run at execution time regardless.
+      continue;
+    }
     for (const nodeId of body) {
       const node = byId.get(nodeId);
       const actionType = node ? getWorkflowActionType(node) : undefined;
