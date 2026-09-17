@@ -334,7 +334,15 @@ function CopyErrorButton({ text }: { text: string }): ReactNode {
   );
 }
 
-/** The clipped one-liner in the row; hovering it reveals the whole message. */
+/**
+ * The step's error inside the row.
+ *
+ * At md and up this is a clipped one-liner and hovering it reveals the whole
+ * message. Below md it is neither: hover does not exist on touch, so the chip
+ * wraps in full and its width cap comes off with the ellipsis, which leaves the
+ * copy button beside it as the only other way to the text. See the workflow-name
+ * row for the same reasoning about hover.
+ */
 function StepErrorMessage({ message }: { message: string }): ReactNode {
   return (
     <span className="flex min-w-0 shrink items-center gap-1">
