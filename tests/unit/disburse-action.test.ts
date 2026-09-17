@@ -33,6 +33,12 @@ vi.mock("@/lib/web3/disbursement-ledger", () => {
 vi.mock("@/lib/execute/value-ledger", () => ({
   withStepValueCap: (_args: unknown, run: () => unknown) => run(),
 }));
+const stablecoinBatchCheck = vi.hoisted(() =>
+  vi.fn(() => Promise.resolve({ kind: "allowed" as const }))
+);
+vi.mock("@/lib/execute/stablecoin-cap", () => ({
+  checkStablecoinTransferAmountBatch: stablecoinBatchCheck,
+}));
 vi.mock("@/lib/safe/signer-resolver", () => ({
   SIGNER_MODE: { EOA: "eoa", SAFE: "safe", SAFE_ROLE: "safe-role" },
   resolveSignerForNode: () => Promise.resolve({ kind: "eoa" }),
@@ -87,6 +93,8 @@ async function refused(overrides: Partial<DisburseCoreInput>): Promise<string> {
 
 beforeEach(() => {
   ledgerReached.mockClear();
+  stablecoinBatchCheck.mockClear();
+  stablecoinBatchCheck.mockResolvedValue({ kind: "allowed" });
 });
 
 describe("web3/disburse registration", () => {
@@ -177,5 +185,83 @@ describe("web3/disburse chain and asset exclusions", () => {
     expect(await refused({ network: "" })).toMatch(/Network is required/);
     expect(await refused({ runKey: "  " })).toMatch(/run key is required/);
     expect(await refused({ legs: "[]" })).toMatch(/non-empty/);
+  });
+});
+
+describe("web3/disburse stablecoin aggregate cap", () => {
+  // Per-leg checks (checkStablecoinTransferAmount, run again inside
+  // transferTokenCore right before each leg sends) bound a single recipient.
+  // Nothing bounded what one node execution moves in total, so a run of
+  // MAX_DISBURSE_LEGS transfers each clearing the per-call ceiling could
+  // still move several multiples of the platform's per-transaction batch
+  // ceiling. checkStablecoinTransferAmountBatch closes that gap and is
+  // called before the ledger is ever touched -- refused() already asserts
+  // that for every case here.
+
+  it("refuses the whole run when the aggregate exceeds the platform's batch cap", async () => {
+    stablecoinBatchCheck.mockResolvedValueOnce({
+      kind: "denied",
+      error: "Stablecoin transfer of 10,000.00 USDC across 2 leg(s) exceeds the 2,000.00 USD per-transaction batch limit",
+    });
+
+    expect(
+      await refused({
+        assetType: "erc20",
+        tokenAddress: USDC_BASE_SEPOLIA,
+        legs: [
+          { recipient: EVM_RECIPIENT, amount: "5000" },
+          { recipient: EVM_RECIPIENT, amount: "5000" },
+        ],
+      })
+    ).toMatch(/exceeds the .* batch limit/);
+  });
+
+  it("sums every leg's amount and passes the run's chain, token and organization through unchanged", async () => {
+    // Denied regardless of the real sum, so the run refuses here rather than
+    // proceeding into the (mocked-to-throw) ledger; the point of this test is
+    // the arguments the check was called with, asserted below.
+    stablecoinBatchCheck.mockResolvedValueOnce({ kind: "denied", error: "x" });
+
+    await refused({
+      assetType: "erc20",
+      tokenAddress: USDC_BASE_SEPOLIA,
+      legs: [
+        { recipient: EVM_RECIPIENT, amount: "1" },
+        { recipient: EVM_RECIPIENT, amount: "2" },
+      ],
+      runKey: "cap-arg-check",
+    });
+
+    expect(stablecoinBatchCheck).toHaveBeenCalledTimes(1);
+    expect(stablecoinBatchCheck).toHaveBeenCalledWith(
+      expect.objectContaining({
+        organizationId: "org-1",
+        chainId: expect.any(Number),
+        tokenAddress: USDC_BASE_SEPOLIA,
+        amounts: ["1", "2"],
+      })
+    );
+  });
+
+  it("does not call the aggregate check for native or SPL legs, even for a run that otherwise validates cleanly", async () => {
+    // Both calls here validate all the way through prepare() (unlike the
+    // refused() cases elsewhere in this file) and only fail because the
+    // ledger mock rejects everything reached past it -- the point is
+    // whether stablecoinBatchCheck was called on the way, not why the run
+    // ultimately failed.
+    await disburseCore(input({ assetType: "native", runKey: "native-scope" }));
+    expect(stablecoinBatchCheck).not.toHaveBeenCalled();
+
+    stablecoinBatchCheck.mockClear();
+    await disburseCore(
+      input({
+        network: "solana-devnet",
+        assetType: "spl",
+        mint: USDC_SOLANA_DEVNET,
+        legs: [{ recipient: SOL_RECIPIENT, amount: "1" }],
+        runKey: "spl-scope-check",
+      })
+    );
+    expect(stablecoinBatchCheck).not.toHaveBeenCalled();
   });
 });

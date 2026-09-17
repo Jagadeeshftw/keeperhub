@@ -2,6 +2,7 @@ import "server-only";
 
 import type { DisbursementLeg } from "@/lib/db/schema";
 import { ExecutionErrorType } from "@/lib/errors/execution-error-type";
+import { checkStablecoinTransferAmountBatch } from "@/lib/execute/stablecoin-cap";
 import { withStepValueCap } from "@/lib/execute/value-ledger";
 import { ErrorCategory, logSystemError } from "@/lib/logging";
 import { getChainIdFromNetwork } from "@/lib/rpc/network-utils";
@@ -227,6 +228,27 @@ async function prepare(
   );
   if (!orgCtx.success) {
     return { ok: false, error: orgCtx.error };
+  }
+
+  // Bounds what this ENTIRE execution moves, not just one leg.
+  // transferTokenCore already runs checkStablecoinTransferAmount per leg
+  // right before it sends, which bounds any single recipient; nothing
+  // bounded the sum across legs, and at MAX_DISBURSE_LEGS legs of the
+  // per-transfer ceiling each, the sum clears the platform's own
+  // per-transaction batch ceiling by several multiples. Scoped to erc20:
+  // native value is already a cumulative daily ledger charged per leg as it
+  // sends, and SPL has no aggregate check to add to here.
+  if (kind === "erc20") {
+    const capDecision = await checkStablecoinTransferAmountBatch({
+      organizationId: orgCtx.organizationId,
+      chainId,
+      tokenAddress: input.tokenAddress?.trim() ?? "",
+      amounts: specs.map((s) => s.amount),
+      context: "web3/disburse",
+    });
+    if (capDecision.kind === "denied") {
+      return { ok: false, error: capDecision.error };
+    }
   }
 
   // Refused up front, before anything is claimed. The Safe and Role signer
