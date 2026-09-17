@@ -56,6 +56,7 @@ import {
   broadcastTransactionHash,
   isOnChainPendingError,
 } from "@/lib/web3/onchain-revert";
+import type { BroadcastHook } from "@/lib/web3/broadcast-hook";
 import { resolveSponsoredSendError } from "@/lib/web3/sponsored-send-error";
 import { executeSponsoredTransaction } from "@/lib/web3/sponsored-transaction-manager";
 import { isGasSponsorshipEnabled } from "@/lib/web3/sponsorship-feature-flag";
@@ -82,6 +83,12 @@ export type TransferFundsCoreInput = {
   // Per-node Web3 Connection field. See parseWeb3Connection in
   // lib/safe/signer-resolver.ts. Missing -> "default" -> org-policy resolver.
   web3Connection?: string;
+  /**
+   * Internal: awaited before the transfer is broadcast (see broadcast-hook.ts).
+   * Used by web3/disburse to record a leg before it can leave. Not a node
+   * config field. Only the EOA signer path supports it.
+   */
+  _broadcastHook?: BroadcastHook;
   _context?: {
     executionId?: string;
     organizationId?: string;
@@ -167,6 +174,7 @@ export async function transferFundsCore(
       recipientAddress,
       gasLimitMultiplier,
       _context,
+      broadcastHook: input._broadcastHook,
     });
   }
 
@@ -274,6 +282,17 @@ export async function transferFundsCore(
     };
   }
 
+  // A caller that needs the pre-broadcast hook cannot use the Safe paths, which
+  // broadcast through their own helpers without it. Refuse before anything is
+  // signed rather than send without the record the hook exists to write.
+  if (input._broadcastHook && signerMode.kind !== SIGNER_MODE.EOA) {
+    return {
+      success: false,
+      error:
+        "This transfer needs the organization wallet signer; Safe and Role signer modes are not supported here.",
+    };
+  }
+
   // Get workflow ID for transaction tracking. The executor already puts
   // workflowId directly on _context for every real workflow execution, so
   // only fall back to a DB lookup when a caller supplies executionId
@@ -325,6 +344,7 @@ export async function transferFundsCore(
         walletAddress,
         to: recipientAddress,
         value: amountInWei,
+        onBroadcastEvent: input._broadcastHook,
       });
 
       if (sponsoredResult !== null) {
@@ -491,6 +511,7 @@ export async function transferFundsCore(
             gasOverrides: { multiplierOverride, gasLimitOverride },
             workflowId,
             rpcManager,
+            beforeBroadcast: input._broadcastHook,
           }
         );
       }
@@ -557,6 +578,7 @@ async function transferFundsSolana(args: {
   recipientAddress: string;
   gasLimitMultiplier?: string;
   _context?: { executionId?: string; organizationId?: string };
+  broadcastHook?: BroadcastHook;
 }): Promise<TransferFundsResult> {
   const { chainId, amount, recipientAddress, gasLimitMultiplier, _context } = args;
 
@@ -660,6 +682,7 @@ async function transferFundsSolana(args: {
       {
         solanaSigner,
         gasOverrides: { gasLimitOverride },
+        beforeBroadcast: args.broadcastHook,
       }
     );
 
